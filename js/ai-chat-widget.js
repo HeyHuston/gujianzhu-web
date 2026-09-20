@@ -2,9 +2,19 @@
   "use strict";
 
   const API_BASE = (function getAPIBase() {
-    if (window.AI_GUIDE_API_BASE) return window.AI_GUIDE_API_BASE;
-    if (window.location.protocol === "file:") return "http://127.0.0.1:8000";
-    return "/";
+    if (window.AI_GUIDE_API_BASE) return String(window.AI_GUIDE_API_BASE).replace(/\/$/, "");
+    if (window.location.protocol === "file:") return "http://127.0.0.1:8090";
+    // 静态页与 FastAPI 分端口时，默认连本机后端
+    const host = window.location.hostname;
+    const port = window.location.port;
+    if (
+      port &&
+      port !== "8090" &&
+      (host === "127.0.0.1" || host === "localhost")
+    ) {
+      return "http://127.0.0.1:8090";
+    }
+    return "";
   })();
   const STYLE_ID = "ai-guide-widget-style-v3";
 
@@ -241,7 +251,7 @@
       /* Markdown content */
       .aig-msg-content strong { color:#f5d870; font-weight:700; }
       .aig-msg-content em { color:rgba(240,220,175,.85); font-style:italic; }
-      .aig-msg-content p { margin:0 0 5px; }
+      .aig-msg-content p { margin:0 0 8px; }
       .aig-msg-content p:last-child { margin-bottom:0; }
 
       /* Inline citation badge */
@@ -478,13 +488,18 @@
     currentLang = detectLang();
   }
 
+  // AI 导览对话固定中文，不跟页面中英切换，也不跟英文提问切换
+  function replyLang() {
+    return "zh";
+  }
+
   /* ─── Markdown + citation renderer ───────────────────────────── */
   function esc(s) {
     return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
   }
   function renderMarkdown(raw, refs) {
-    const lines = (raw || "").split("\n");
-    const out = lines.map(line => {
+    const lines = String(raw || "").split("\n").map(line => line.trim()).filter(Boolean);
+    const html = lines.map(line => {
       line = esc(line);
       line = line.replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
       line = line.replace(/(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)/g, "<em>$1</em>");
@@ -496,10 +511,9 @@
           : "";
         return `<span class="aig-cite"${da}>${n}</span>`;
       });
-      return line;
-    });
-    const html = out.join("\n").replace(/\n{2,}/g,"</p><p>").replace(/\n/g,"<br>");
-    return `<span class="aig-msg-content"><p>${html}</p></span>`;
+      return `<p>${line}</p>`;
+    }).join("");
+    return `<span class="aig-msg-content">${html}</span>`;
   }
 
   /* ═══════════════════════════════════════════════════════════════
@@ -1227,6 +1241,14 @@
     }
 
     /* ─── Send ─────────────────────────────────────────────────── */
+    const chatHistory = [];
+
+    function paintAnswer(answerEl, answerText, refs) {
+      answerEl.innerHTML = renderMarkdown(answerText, refs);
+      bindCites(answerEl, refs);
+      msgBox.scrollTop = msgBox.scrollHeight;
+    }
+
     async function ask() {
       if (sending) return;
       const q = (input.value || "").trim();
@@ -1234,19 +1256,20 @@
       input.value = ""; input.style.height = "auto";
       sending = true; sendBtn.disabled = true;
 
-      refreshLang(); // 实时跟随站点语言切换
+      const history = chatHistory.slice(-6);
+      chatHistory.push({ role: "user", content: q });
 
       appendMsg("user", q);
       const answerEl = appendMsg("assistant", "思考中…", "thinking aig-cursor");
-      let refs = [], answerText = "", firstToken = true;
+      let refs = [], answerText = "", firstToken = true, refsEl = null, failed = false;
 
       try {
         const url = API_BASE + "/api/chat";
         console.log("[AI向导] 发送请求:", url, q);
         const resp = await fetch(url, {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ query: q, lang: currentLang, history: [] }),
+          headers: { "Content-Type": "application/json", "Accept": "text/event-stream" },
+          body: JSON.stringify({ query: q, lang: replyLang(), history }),
         });
         console.log("[AI向导] 响应状态:", resp.status, resp.ok);
         if (!resp.ok) throw new Error("HTTP " + resp.status);
@@ -1268,44 +1291,56 @@
             let p; try { p = JSON.parse(line.slice(6)); } catch { continue; }
             if (p.type === "kb_sources") {
               refs = p.data || [];
-            } else if (p.type === "token") {
-              const piece = p.data || "";
-              if (firstToken && piece.length) {
+              if (!refsEl) {
+                refsEl = renderRefs(refs);
+                if (refsEl) msgBox.appendChild(refsEl);
+              }
+            } else if (p.type === "sentence" || p.type === "token") {
+              const piece = String(p.data || "");
+              if (!piece) continue;
+              if (firstToken) {
                 firstToken = false;
-                answerEl.innerHTML = "";
                 answerEl.classList.remove("thinking");
               }
-              answerText += piece;
-              answerEl.textContent = answerText;
-              msgBox.scrollTop = msgBox.scrollHeight;
+              if (p.type === "sentence") {
+                answerText += (answerText ? "\n" : "") + piece.trim();
+              } else {
+                answerText += piece;
+              }
+              paintAnswer(answerEl, answerText, refs);
+              // 同一批到达的多句也逐句上屏，避免整段一起闪出来
+              if (p.type === "sentence") {
+                await new Promise(resolve => setTimeout(resolve, 200));
+              }
             } else if (p.type === "error") {
+              failed = true;
               answerEl.textContent = "出错：" + (p.data || "未知错误");
               answerEl.classList.remove("thinking", "aig-cursor");
+              firstToken = false;
             }
           }
         }
 
         answerEl.classList.remove("aig-cursor", "thinking");
-        if (firstToken) {
+        if (failed) {
+          answerEl.dataset.aigRaw = answerEl.textContent || "";
+        } else if (firstToken) {
           answerEl.innerHTML = "暂无回答，请确认后端服务已启动。";
           answerEl.dataset.aigRaw = "暂无回答，请确认后端服务已启动。";
         } else {
-          // Final render: markdown + citation badges
-          answerEl.innerHTML = renderMarkdown(answerText, refs);
-          bindCites(answerEl, refs);
+          paintAnswer(answerEl, answerText, refs);
           answerEl.dataset.aigRaw = answerText;
+          chatHistory.push({ role: "assistant", content: answerText });
         }
-        // 所有 AI 回答都添加朗读按钮
         addSpeakButton(answerEl);
-        // Append reference list as sibling after the answer bubble
-        const refsEl = renderRefs(refs);
-        if (refsEl) {
-          msgBox.appendChild(refsEl);
-          msgBox.scrollTop = msgBox.scrollHeight;
+        if (!refsEl) {
+          refsEl = renderRefs(refs);
+          if (refsEl) msgBox.appendChild(refsEl);
         }
+        msgBox.scrollTop = msgBox.scrollHeight;
       } catch (err) {
         console.error("[AI向导] 请求失败:", err);
-        answerEl.innerHTML = "连接失败，请确认后端已在 http://127.0.0.1:8000 启动。";
+        answerEl.innerHTML = "连接失败，请确认后端服务已启动。";
         answerEl.classList.remove("thinking", "aig-cursor");
         answerEl.dataset.aigRaw = "连接失败，请确认后端服务已启动";
         addSpeakButton(answerEl);
@@ -1349,8 +1384,7 @@
       btn.classList.add("playing");
       btn.innerHTML = `<svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><path d="M6 4h4v16H6zM14 4h4v16h-4z"/></svg>播放中`;
 
-      refreshLang(); // 跟随站点语言切换
-      const lang = currentLang === "en" ? "en-US" : "zh-CN";
+      const lang = "zh-CN";
       TTSPlayer.play(raw, lang, () => {
         btn.classList.remove("playing");
         btn.innerHTML = `<svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>朗读`;

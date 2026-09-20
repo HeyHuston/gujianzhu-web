@@ -70,7 +70,15 @@ def chat(req: ChatRequest) -> StreamingResponse:
             yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
             yield f"data: {json.dumps({'type': 'done'}, ensure_ascii=False)}\n\n"
 
-    return StreamingResponse(event_stream(), media_type="text/event-stream")
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 # ── 页面讲解稿（太和殿 / 御花园）───────────────────────────────────
